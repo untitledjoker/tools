@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Safe Transaction Signer</title>
+<script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+<style>
+  body { font-family: monospace; max-width: 700px; margin: 40px auto; background:#111; color:#eee; }
+  input, textarea { width: 100%; padding: 6px; margin: 4px 0 12px; background:#222; color:#eee; border:1px solid #444; }
+  label { font-weight: bold; }
+  button { padding: 10px 16px; margin: 6px 4px 6px 0; cursor: pointer; }
+  #output { white-space: pre-wrap; background:#000; padding:12px; border:1px solid #333; margin-top:16px; word-break: break-all; }
+  .row { display:flex; gap:10px; }
+  .row > div { flex:1; }
+</style>
+</head>
+<body>
+
+<h2>🔏 Safe Transaction Signer (MetaMask)</h2>
+<p>Connects to MetaMask, builds the exact EIP-712 Safe transaction data, and signs it using <code>eth_signTypedData_v4</code> — the same method used by app.safe.global.</p>
+
+<button onclick="connectWallet()">1. Connect MetaMask</button>
+<span id="account"></span>
+
+<h3>Safe Transaction Parameters</h3>
+
+<label>Safe Address (verifyingContract)</label>
+<input id="safeAddress" placeholder="0xYourSafeAddress">
+
+<label>Chain ID</label>
+<input id="chainId" value="8453" placeholder="8453 = Base Mainnet">
+
+<div class="row">
+  <div>
+    <label>To</label>
+    <input id="to" placeholder="0xTargetAddress">
+  </div>
+  <div>
+    <label>Value (wei)</label>
+    <input id="value" value="0">
+  </div>
+</div>
+
+<label>Data (hex calldata)</label>
+<textarea id="data" rows="3" placeholder="0x">0x</textarea>
+
+<div class="row">
+  <div>
+    <label>Operation (0=Call, 1=DelegateCall)</label>
+    <input id="operation" value="0">
+  </div>
+  <div>
+    <label>Nonce</label>
+    <input id="nonce" placeholder="Get from Safe.nonce()">
+  </div>
+</div>
+
+<div class="row">
+  <div><label>safeTxGas</label><input id="safeTxGas" value="0"></div>
+  <div><label>baseGas</label><input id="baseGas" value="0"></div>
+  <div><label>gasPrice</label><input id="gasPrice" value="0"></div>
+</div>
+
+<div class="row">
+  <div>
+    <label>Gas Token</label>
+    <input id="gasToken" value="0x0000000000000000000000000000000000000000">
+  </div>
+  <div>
+    <label>Refund Receiver</label>
+    <input id="refundReceiver" value="0x0000000000000000000000000000000000000000">
+  </div>
+</div>
+
+<button onclick="signTransaction()">2. Sign Transaction</button>
+
+<div id="output"></div>
+
+<script>
+let provider, signer, userAddress;
+
+async function connectWallet() {
+  if (!window.ethereum) {
+    alert("MetaMask not found!");
+    return;
+  }
+  provider = new ethers.providers.Web3Provider(window.ethereum);
+  await provider.send("eth_requestAccounts", []);
+  signer = provider.getSigner();
+  userAddress = await signer.getAddress();
+  document.getElementById("account").innerText = " ✅ Connected: " + userAddress;
+}
+
+async function signTransaction() {
+  if (!signer) {
+    alert("Connect MetaMask first!");
+    return;
+  }
+
+  const safeAddress    = document.getElementById("safeAddress").value.trim();
+  const chainId        = parseInt(document.getElementById("chainId").value.trim());
+  const to             = document.getElementById("to").value.trim();
+  const value          = document.getElementById("value").value.trim();
+  const data           = document.getElementById("data").value.trim();
+  const operation      = parseInt(document.getElementById("operation").value.trim());
+  const safeTxGas      = document.getElementById("safeTxGas").value.trim();
+  const baseGas        = document.getElementById("baseGas").value.trim();
+  const gasPrice       = document.getElementById("gasPrice").value.trim();
+  const gasToken       = document.getElementById("gasToken").value.trim();
+  const refundReceiver = document.getElementById("refundReceiver").value.trim();
+  const nonce          = document.getElementById("nonce").value.trim();
+
+  // ── EIP-712 Domain (matches Safe.sol domainSeparator()) ──
+  const domain = {
+    chainId: chainId,
+    verifyingContract: safeAddress
+  };
+
+  // ── EIP-712 Types (matches SAFE_TX_TYPEHASH) ──
+  const types = {
+    SafeTx: [
+      { name: "to", type: "address" },
+      { name: "value", type: "uint256" },
+      { name: "data", type: "bytes" },
+      { name: "operation", type: "uint8" },
+      { name: "safeTxGas", type: "uint256" },
+      { name: "baseGas", type: "uint256" },
+      { name: "gasPrice", type: "uint256" },
+      { name: "gasToken", type: "address" },
+      { name: "refundReceiver", type: "address" },
+      { name: "nonce", type: "uint256" }
+    ]
+  };
+
+  const message = {
+    to, value, data, operation,
+    safeTxGas, baseGas, gasPrice,
+    gasToken, refundReceiver, nonce
+  };
+
+  try {
+    // ── Sign using EIP-712 (produces clean v=27/28, matches Safe's ecrecover flow) ──
+    const signature = await signer._signTypedData(domain, types, message);
+
+    // ── Independently compute the hash for display/cross-check ──
+    const safeTxHash = ethers.utils._TypedDataEncoder.hash(domain, types, message);
+
+    // ── Split signature into r, s, v ──
+    const sig = ethers.utils.splitSignature(signature);
+
+    const output = `
+✅ SIGNED SUCCESSFULLY
+
+Signer Address:
+${userAddress}
+
+safeTxHash (EIP-712 digest):
+${safeTxHash}
+
+Full Signature (r+s+v, ready to concatenate with other owners):
+${signature}
+
+Breakdown:
+  r = ${sig.r}
+  s = ${sig.s}
+  v = ${sig.v}   (should be 27 or 28 — standard ECDSA, matches Safe's default ecrecover branch)
+
+──────────────────────────────────────────
+Next steps:
+1. Share this full signature with whoever is collecting signatures for this Safe tx.
+2. Once enough signatures are collected (meeting threshold), sort them by
+   signer address ASCENDING, concatenate them with no separators, and
+   pass the result as the "signatures" parameter to execTransaction().
+──────────────────────────────────────────
+`;
+    document.getElementById("output").innerText = output;
+
+  } catch (err) {
+    document.getElementById("output").innerText = "❌ Error: " + err.message;
+    console.error(err);
+  }
+}
+</script>
+
+</body>
+</html>
