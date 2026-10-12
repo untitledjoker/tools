@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Safe Signature Checker</title>
+<script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
+<style>
+  body { font-family: monospace; max-width: 800px; margin: 40px auto; background:#111; color:#eee; }
+  input, textarea { width: 100%; padding: 8px; margin: 4px 0 14px; background:#222; color:#eee; border:1px solid #444; box-sizing: border-box; }
+  label { font-weight: bold; display:block; margin-top: 10px; }
+  button { padding: 10px 18px; margin: 10px 4px 10px 0; cursor: pointer; background:#2d6cdf; color:#fff; border:none; border-radius:4px; }
+  button:hover { background:#1b4fab; }
+  #output { white-space: pre-wrap; background:#000; padding:14px; border:1px solid #333; margin-top:16px; word-break: break-all; border-radius:4px; min-height: 40px; }
+  .ok { color: #4ade80; }
+  .fail { color: #f87171; }
+  .warn { color: #fbbf24; }
+  h2 { color: #60a5fa; }
+  small { color: #999; }
+</style>
+</head>
+<body>
+
+<h2>🔏 Safe Signature Checker</h2>
+<p><small>Client-side verification of a packed Safe signature blob against an owners list and threshold. Mirrors the exact logic of <code>checkNSignatures()</code> from Safe.sol — runs entirely in your browser, no transaction required.</small></p>
+
+<label>Safe Transaction Hash (safeTxHash, bytes32)</label>
+<input id="dataHash" placeholder="0x...">
+
+<label>Owners List (comma-separated addresses)</label>
+<textarea id="owners" rows="2" placeholder="0xOwner1,0xOwner2,0xOwner3"></textarea>
+
+<label>Threshold (required number of valid signatures)</label>
+<input id="threshold" value="2">
+
+<label>Packed Signatures Blob (hex, 65 bytes per signer)</label>
+<textarea id="signatures" rows="3" placeholder="0x..."></textarea>
+
+<button onclick="verify()">✅ Verify Signatures</button>
+<button onclick="splitOnly()">🔍 Just Split & Recover (no ordering/owner checks)</button>
+
+<div id="output">Results will appear here...</div>
+
+<script>
+const SENTINEL_OWNERS = "0x0000000000000000000000000000000000000001";
+
+function splitSignature(sigsHex, index) {
+  const clean = sigsHex.startsWith("0x") ? sigsHex.slice(2) : sigsHex;
+  const start = index * 130; // 65 bytes = 130 hex chars
+  const chunk = clean.slice(start, start + 130);
+  if (chunk.length < 130) throw new Error(`Signature ${index + 1} is incomplete (got ${chunk.length / 2} bytes, need 65)`);
+
+  const r = "0x" + chunk.slice(0, 64);
+  const s = "0x" + chunk.slice(64, 128);
+  const v = parseInt(chunk.slice(128, 130), 16);
+  return { r, s, v };
+}
+
+function recoverSigner(dataHash, r, s, v) {
+  if (v > 30) {
+    // eth_sign flow: adjust v, hash with Ethereum prefix
+    const adjustedV = v - 4;
+    const prefixedHash = ethers.utils.hashMessage(ethers.utils.arrayify(dataHash));
+    return ethers.utils.recoverAddress(prefixedHash, { r, s, v: adjustedV });
+  } else if (v === 0 || v === 1) {
+    // Contract signature or pre-approved hash: address encoded directly in r
+    return ethers.utils.getAddress("0x" + r.slice(-40));
+  } else {
+    // Standard ECDSA
+    return ethers.utils.recoverAddress(dataHash, { r, s, v });
+  }
+}
+
+function signatureTypeLabel(v) {
+  if (v === 0) return "Contract Signature (EIP-1271)";
+  if (v === 1) return "Pre-approved Hash";
+  if (v > 30) return "eth_sign (prefixed)";
+  return "Standard ECDSA";
+}
+
+function splitOnly() {
+  const out = document.getElementById("output");
+  try {
+    const dataHash = document.getElementById("dataHash").value.trim();
+    const sigsHex = document.getElementById("signatures").value.trim();
+
+    if (!ethers.utils.isHexString(dataHash, 32)) throw new Error("dataHash must be a 32-byte hex string");
+
+    const clean = sigsHex.startsWith("0x") ? sigsHex.slice(2) : sigsHex;
+    const totalBytes = clean.length / 2;
+    const count = Math.floor(totalBytes / 65);
+
+    let log = `Total signature bytes: ${totalBytes} → ${count} signature(s) detected\n`;
+    if (totalBytes % 65 !== 0) {
+      log += `⚠️ Warning: length is not a clean multiple of 65 bytes — check for formatting errors.\n`;
+    }
+    log += "\n";
+
+    for (let i = 0; i < count; i++) {
+      const { r, s, v } = splitSignature(sigsHex, i);
+      const signer = recoverSigner(dataHash, r, s, v);
+      log += `Signature ${i + 1}:\n`;
+      log += `  r = ${r}\n`;
+      log += `  s = ${s}\n`;
+      log += `  v = ${v}  (${signatureTypeLabel(v)})\n`;
+      log += `  → Recovered signer: ${signer}\n\n`;
+    }
+
+    out.innerHTML = log;
+  } catch (e) {
+    out.innerHTML = `<span class="fail">❌ Error: ${e.message}</span>`;
+  }
+}
+
+function verify() {
+  const out = document.getElementById("output");
+  try {
+    const dataHash = document.getElementById("dataHash").value.trim();
+    const ownersRaw = document.getElementById("owners").value.trim();
+    const threshold = parseInt(document.getElementById("threshold").value.trim());
+    const sigsHex = document.getElementById("signatures").value.trim();
+
+    if (!ethers.utils.isHexString(dataHash, 32)) throw new Error("dataHash must be a valid 32-byte hex string");
+    if (!ownersRaw) throw new Error("Provide at least one owner address");
+    if (!threshold || threshold < 1) throw new Error("Threshold must be >= 1");
+
+    const owners = ownersRaw.split(",").map(a => ethers.utils.getAddress(a.trim()));
+
+    const clean = sigsHex.startsWith("0x") ? sigsHex.slice(2) : sigsHex;
+    const totalBytes = clean.length / 2;
+
+    let log = "";
+
+    // ── Length check (matches Safe's GS020) ──
+    if (totalBytes < threshold * 65) {
+      out.innerHTML = `<span class="fail">❌ FAIL (GS020): Signatures too short.\nNeed at least ${threshold * 65} bytes, got ${totalBytes}.</span>`;
+      return;
+    }
+    log += `✓ Length check passed: ${totalBytes} bytes >= required ${threshold * 65} bytes\n\n`;
+
+    let lastOwner = ethers.constants.AddressZero;
+    let validCount = 0;
+    let allValid = true;
+
+    for (let i = 0; i < threshold; i++) {
+      const { r, s, v } = splitSignature(sigsHex, i);
+      const currentOwner = recoverSigner(dataHash, r, s, v);
+
+      log += `Signature ${i + 1} (${signatureTypeLabel(v)}):\n`;
+      log += `  Recovered: ${currentOwner}\n`;
+
+      // ── Ordering check (matches Safe's GS026 part 1) ──
+      const isOrdered = ethers.BigNumber.from(currentOwner).gt(ethers.BigNumber.from(lastOwner));
+      // ── Ownership check (matches Safe's GS026 part 2) ──
+      const isOwner = owners.some(o => o.toLowerCase() === currentOwner.toLowerCase());
+      // ── Sentinel check (matches Safe's GS026 part 3) ──
+      const isNotSentinel = currentOwner.toLowerCase() !== SENTINEL_OWNERS.toLowerCase();
+
+      if (isOrdered && isOwner && isNotSentinel) {
+        log += `  <span class="ok">✓ Valid: ordered, is owner, not sentinel</span>\n\n`;
+        validCount++;
+      } else {
+        allValid = false;
+        log += `  <span class="fail">✗ INVALID (GS026):</span>\n`;
+        if (!isOrdered) log += `    - Not in strictly ascending order (prev: ${lastOwner})\n`;
+        if (!isOwner) log += `    - Address is NOT in the owners list\n`;
+        if (!isNotSentinel) log += `    - Address equals SENTINEL_OWNERS (invalid)\n`;
+        log += "\n";
+      }
+
+      lastOwner = currentOwner;
+    }
+
+    log += "──────────────────────────────\n";
+    if (allValid && validCount >= threshold) {
+      log += `<span class="ok">✅ RESULT: All ${validCount}/${threshold} signatures VALID. checkSignatures() would PASS.</span>`;
+    } else {
+      log += `<span class="fail">❌ RESULT: Signature check would REVERT. ${validCount}/${threshold} valid.</span>`;
+    }
+
+    out.innerHTML = log;
+
+  } catch (e) {
+    out.innerHTML = `<span class="fail">❌ Error: ${e.message}</span>`;
+  }
+}
+</script>
+
+</body>
+</html>
